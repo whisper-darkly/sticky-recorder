@@ -2,6 +2,8 @@ package recorder
 
 import (
 	"bytes"
+	"os"
+	"strings"
 	"text/template"
 	"time"
 )
@@ -67,7 +69,9 @@ func NewTemplateData(source, driverName string, sessionStart, recordingStart, se
 }
 
 // RenderTemplate evaluates a Go text/template string with the given data.
+// A leading "~/" or "~" alone is expanded to the user's home directory.
 func RenderTemplate(pattern string, data *TemplateData) (string, error) {
+	pattern = expandTilde(pattern)
 	tpl, err := template.New("path").Parse(pattern)
 	if err != nil {
 		return "", err
@@ -77,4 +81,19 @@ func RenderTemplate(pattern string, data *TemplateData) (string, error) {
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+// expandTilde replaces a leading ~ with the user's home directory.
+func expandTilde(path string) string {
+	if path == "~" {
+		if h, err := os.UserHomeDir(); err == nil {
+			return h
+		}
+	}
+	if strings.HasPrefix(path, "~/") {
+		if h, err := os.UserHomeDir(); err == nil {
+			return h + path[1:]
+		}
+	}
+	return path
 }

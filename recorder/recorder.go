@@ -42,6 +42,7 @@ type Config struct {
 	SegmentTimeout   time.Duration // Reconnect within this = same recording, new segment
 	RecordingTimeout time.Duration // Reconnect within this = new recording in same session
 	CheckInterval    time.Duration // Watch mode interval (0 = one-shot, exit on offline/end)
+	ShortPaths       bool          // If true, emit only filenames in events instead of full paths
 
 	Log *logger.Logger
 }
@@ -547,9 +548,16 @@ func (r *Recorder) segmentTargetInfo() string {
 	return strings.Join(parts, " ")
 }
 
+func (r *Recorder) displayPath(file string) string {
+	if r.cfg.ShortPaths {
+		return filepath.Base(file)
+	}
+	return file
+}
+
 func (r *Recorder) emitSegmentStart(file, targetInfo string) {
 	msg := fmt.Sprintf("SEGMENT START file=%s segment=%d recording=%d",
-		filepath.Base(file), r.segmentCount-1, r.recordingCount-1)
+		r.displayPath(file), r.segmentCount-1, r.recordingCount-1)
 	if targetInfo != "" {
 		msg += " " + targetInfo
 	}
@@ -558,7 +566,7 @@ func (r *Recorder) emitSegmentStart(file, targetInfo string) {
 
 func (r *Recorder) emitSegmentFinish(file, targetInfo string, elapsed time.Duration, size int64, trigger string, ffmpegErr error) {
 	msg := fmt.Sprintf("SEGMENT FINISH file=%s segment=%d recording=%d duration=%s size=%s trigger=%s",
-		filepath.Base(file), r.segmentCount-1, r.recordingCount-1,
+		r.displayPath(file), r.segmentCount-1, r.recordingCount-1,
 		units.FormatDuration(elapsed),
 		formatBytes(size),
 		trigger)

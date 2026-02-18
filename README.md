@@ -87,7 +87,9 @@ CLI flags take priority over environment variables.
 
 `STICKY_DRIVER`, `STICKY_RESOLUTION`, `STICKY_FRAMERATE`, `STICKY_SEGMENT_LENGTH`, `STICKY_SEGMENT_SIZE`, `STICKY_COOKIES`, `STICKY_USER_AGENT`, `STICKY_LOG`, `STICKY_LOG_LEVEL`, `STICKY_RETRY_DELAY`, `STICKY_SEGMENT_TIMEOUT`, `STICKY_RECORDING_TIMEOUT`, `STICKY_CHECK_INTERVAL`
 
-Environment-only: `STICKY_EXEC_FATAL=1` makes non-zero exec exit codes kill the session.
+Environment-only:
+- `STICKY_EXEC_FATAL=1` — non-zero exec exit codes kill the session.
+- `STICKY_SHORT_PATHS=1` — emit only filenames (not full paths) in segment events.
 
 ### Cookie Pool
 

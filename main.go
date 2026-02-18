@@ -139,6 +139,7 @@ func main() {
 		LogPattern:       *logPattern,
 		ExecArgs:         execArgs,
 		ExecFatal:        os.Getenv("STICKY_EXEC_FATAL") != "",
+		ShortPaths:       os.Getenv("STICKY_SHORT_PATHS") != "",
 		SegmentLength:    durationVal(*segmentLength, "STICKY_SEGMENT_LENGTH", 0, log),
 		SegmentSize:      sizeVal(*segmentSize, "STICKY_SEGMENT_SIZE", 0, log),
 		RetryDelay:       durationVal(*retryDelay, "STICKY_RETRY_DELAY", 5*time.Second, log),
