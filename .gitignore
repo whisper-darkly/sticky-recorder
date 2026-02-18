@@ -1,0 +1,15 @@
+# Build output
+dist/
+sticky-recorder
+
+# IDE / editor
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
