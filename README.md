@@ -20,7 +20,7 @@ make install PREFIX=~/.local  # installs to ~/.local/bin
 ## Usage
 
 ```
-sticky-recorder [flags] [--out] <output-template>
+sticky-recorder [flags] <source> [output-template]
 ```
 
 ### Duration & Size Formats

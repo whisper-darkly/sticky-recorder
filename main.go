@@ -57,7 +57,7 @@ func main() {
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "sticky-recorder %s\n\n", version)
-		fmt.Fprintf(os.Stderr, "Usage: %s [flags] [--out] <output-template>\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <source> [output-template]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Record live streams. Exits with code 2 if offline.\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
@@ -77,11 +77,14 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Support positional last argument as output template
-	if *outPattern == "" && flag.NArg() > 0 {
-		*outPattern = flag.Arg(flag.NArg() - 1)
-		if *source == "" && flag.NArg() > 1 {
+	// Support positional arguments: [source] [output-template]
+	// First positional is source, second (if present) is output template.
+	if flag.NArg() > 0 {
+		if *source == "" {
 			*source = flag.Arg(0)
+		}
+		if *outPattern == "" && flag.NArg() > 1 {
+			*outPattern = flag.Arg(flag.NArg() - 1)
 		}
 	}
 
