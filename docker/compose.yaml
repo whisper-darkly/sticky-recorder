@@ -1,0 +1,18 @@
+services:
+  recorder:
+    image: sticky-recorder:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      OVERSEER_PORT: 8080
+      # OVERSEER_TRUSTED_CIDRS: 10.0.0.0/8
+      OVERSEER_LOG_FILE: /data/overseer.jsonl
+      OVERSEER_DB: /data/overseer.db
+      STICKY_DRIVER: chaturbate
+      STICKY_RESOLUTION: 720
+      STICKY_FRAMERATE: 30
+      STICKY_LOG_LEVEL: error
+      # STICKY_COOKIES: /data/cookies.txt
