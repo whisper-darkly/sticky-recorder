@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,14 @@ const (
 	LevelWarn
 	LevelError
 	LevelFatal
+)
+
+// Format represents the output format for log messages.
+type Format int
+
+const (
+	FormatNormal Format = iota
+	FormatJSON
 )
 
 // ParseLevel converts a string to a Level. Case-insensitive. Defaults to LevelInfo.
@@ -38,6 +47,16 @@ func ParseLevel(s string) Level {
 	}
 }
 
+// ParseFormat converts a string to a Format. Case-insensitive. Defaults to FormatNormal.
+func ParseFormat(s string) Format {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "json":
+		return FormatJSON
+	default:
+		return FormatNormal
+	}
+}
+
 func (l Level) String() string {
 	switch l {
 	case LevelDebug:
@@ -55,6 +74,29 @@ func (l Level) String() string {
 	}
 }
 
+func (l Level) jsonString() string {
+	switch l {
+	case LevelDebug:
+		return "debug"
+	case LevelInfo:
+		return "info"
+	case LevelWarn:
+		return "warn"
+	case LevelError:
+		return "error"
+	case LevelFatal:
+		return "fatal"
+	default:
+		return "unknown"
+	}
+}
+
+// KV is an ordered key-value pair for structured event logging.
+type KV struct {
+	Key   string
+	Value string
+}
+
 // Logger provides leveled, dual-output logging.
 //
 // Without a log file (file == nil):
@@ -67,14 +109,22 @@ func (l Level) String() string {
 //   - Event messages additionally → stdout
 //   - WARN/ERROR/FATAL additionally → stderr
 type Logger struct {
-	level Level
-	file  io.Writer // nil if no log file
-	mu    sync.Mutex
+	level  Level
+	format Format
+	file   io.Writer // nil if no log file
+	mu     sync.Mutex
 }
 
 // New creates a Logger at the given level with no file output.
 func New(level Level) *Logger {
 	return &Logger{level: level}
+}
+
+// SetFormat sets the output format (normal or JSON).
+func (l *Logger) SetFormat(f Format) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.format = f
 }
 
 // SetFile sets the log file writer. Pass nil to disable file logging.
@@ -109,25 +159,47 @@ func (l *Logger) Fatal(format string, args ...any) {
 	os.Exit(1)
 }
 
-// Event emits a lifecycle event (session/recording/segment). Events always emit
-// regardless of log level.
+// Event emits a structured lifecycle event with ordered key-value pairs.
+// Events always emit regardless of log level.
 //
-// Without a log file: printed to stdout.
-// With a log file: printed to both the file and stdout.
-func (l *Logger) Event(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	ts := time.Now().Format("2006/01/02 15:04:05")
-	line := fmt.Sprintf("%s [EVENT] %s", ts, msg)
+// Normal format: 2006/01/02 15:04:05 [EVENT] SEGMENT START file=/path/to/file segment=0
+// JSON format:   {"time":"...","event":"SEGMENT START","file":"/path/to/file","segment":"0"}
+func (l *Logger) Event(event string, kvs ...KV) {
+	now := time.Now()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	var line string
+	if l.format == FormatJSON {
+		obj := map[string]any{
+			"time":  now.Format(time.RFC3339),
+			"event": event,
+		}
+		for _, kv := range kvs {
+			obj[kv.Key] = kv.Value
+		}
+		b, _ := json.Marshal(obj)
+		line = string(b)
+	} else {
+		ts := now.Format("2006/01/02 15:04:05")
+		var sb strings.Builder
+		sb.WriteString(ts)
+		sb.WriteString(" [EVENT] ")
+		sb.WriteString(event)
+		for _, kv := range kvs {
+			sb.WriteByte(' ')
+			sb.WriteString(kv.Key)
+			sb.WriteByte('=')
+			sb.WriteString(kv.Value)
+		}
+		line = sb.String()
+	}
+
 	if l.file != nil {
 		fmt.Fprintln(l.file, line)
-		fmt.Fprintln(os.Stdout, line)
-	} else {
-		fmt.Fprintln(os.Stdout, line)
 	}
+	fmt.Fprintln(os.Stdout, line)
 }
 
 // Writer returns an io.Writer that logs each line at the given level.
@@ -142,21 +214,31 @@ func (l *Logger) emit(level Level, format string, args ...any) {
 	}
 
 	msg := fmt.Sprintf(format, args...)
-	ts := time.Now().Format("2006/01/02 15:04:05")
-	line := fmt.Sprintf("%s [%s] %s", ts, level, msg)
+	now := time.Now()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	var line string
+	if l.format == FormatJSON {
+		obj := map[string]any{
+			"time":    now.Format(time.RFC3339),
+			"level":   level.jsonString(),
+			"message": msg,
+		}
+		b, _ := json.Marshal(obj)
+		line = string(b)
+	} else {
+		ts := now.Format("2006/01/02 15:04:05")
+		line = fmt.Sprintf("%s [%s] %s", ts, level, msg)
+	}
+
 	if l.file != nil {
-		// File gets everything
 		fmt.Fprintln(l.file, line)
-		// WARN+ also to stderr
 		if level >= LevelWarn {
 			fmt.Fprintln(os.Stderr, line)
 		}
 	} else {
-		// No file: INFO and below to stdout, WARN+ to stderr
 		if level >= LevelWarn {
 			fmt.Fprintln(os.Stderr, line)
 		} else {

@@ -36,13 +36,13 @@ func main() {
 	resolution := flag.StringP("resolution", "r", "", "Target video resolution height (default 720)")
 	framerate := flag.StringP("framerate", "f", "", "Target framerate (default 30)")
 	segmentLength := flag.StringP("segment-length", "l", "", "Max segment duration (0=disabled, e.g. 60, 1h, 01:00:00)")
-	segmentSize := flag.StringP("segment-size", "z", "", "Max segment size (0=disabled, e.g. 500, 500MB, 1.5GB)")
-	domain := flag.String("domain", "", "Override platform domain URL")
+domain := flag.String("domain", "", "Override platform domain URL")
 	cookies := flag.StringP("cookies", "c", envOrDefault("STICKY_COOKIES", ""), "HTTP cookies (format: key=value; key2=value2)")
 	userAgent := flag.StringP("user-agent", "a", envOrDefault("STICKY_USER_AGENT", ""), "Custom User-Agent header")
 	outPattern := flag.StringP("out", "o", "", "Output file path template (required, extension added by driver)")
 	logPattern := flag.String("log", envOrDefault("STICKY_LOG", ""), "Log file path template (empty=stdout only)")
 	logLevel := flag.String("log-level", envOrDefault("STICKY_LOG_LEVEL", "info"), "Log level: debug, info, warn, error, fatal")
+	outputFormat := flag.String("output-format", envOrDefault("STICKY_OUTPUT_FORMAT", "normal"), "Output format: normal, json")
 	retryDelay := flag.String("retry-delay", "", "Retry delay (default 00:00:05, e.g. 5s, 00:00:05)")
 	segmentTimeout := flag.String("segment-timeout", "", "Same-recording reconnect window (default 00:05:00, e.g. 5m)")
 	recordingTimeout := flag.String("recording-timeout", "", "New-recording reconnect window (default 00:30:00, e.g. 30m)")
@@ -61,7 +61,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Record live streams. Exits with code 2 if offline.\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nDurations: hh:mm:ss | 1h30m | plain minutes.  Sizes: 1.5GB | 500MB | plain MB.\n")
+		fmt.Fprintf(os.Stderr, "\nDurations: hh:mm:ss | 1h30m | plain minutes.\n")
 		fmt.Fprintf(os.Stderr, "Exit codes: 0=ok  1=error  2=offline  3=blocked\n")
 	}
 
@@ -95,6 +95,7 @@ func main() {
 
 	// Create logger early so all validation messages use it
 	log := logger.New(logger.ParseLevel(*logLevel))
+	log.SetFormat(logger.ParseFormat(*outputFormat))
 
 	if *source == "" {
 		log.Fatal("--source is required")
@@ -139,9 +140,7 @@ func main() {
 		LogPattern:       *logPattern,
 		ExecArgs:         execArgs,
 		ExecFatal:        os.Getenv("STICKY_EXEC_FATAL") != "",
-		ShortPaths:       os.Getenv("STICKY_SHORT_PATHS") != "",
 		SegmentLength:    durationVal(*segmentLength, "STICKY_SEGMENT_LENGTH", 0, log),
-		SegmentSize:      sizeVal(*segmentSize, "STICKY_SEGMENT_SIZE", 0, log),
 		RetryDelay:       durationVal(*retryDelay, "STICKY_RETRY_DELAY", 5*time.Second, log),
 		SegmentTimeout:   durationVal(*segmentTimeout, "STICKY_SEGMENT_TIMEOUT", 5*time.Minute, log),
 		RecordingTimeout: durationVal(*recordingTimeout, "STICKY_RECORDING_TIMEOUT", 30*time.Minute, log),
@@ -300,26 +299,6 @@ func durationVal(cliVal, envKey string, def time.Duration, log *logger.Logger) t
 			log.Fatal("invalid duration in %s: %v", envKey, err)
 		}
 		return d
-	}
-	return def
-}
-
-// sizeVal resolves a size in bytes from: CLI string (if non-empty) → ENV → default.
-// Uses units.ParseSize for flexible format support ({n}TB/GB/MB, plain MB).
-func sizeVal(cliVal, envKey string, def int64, log *logger.Logger) int64 {
-	if cliVal != "" {
-		b, err := units.ParseSize(cliVal)
-		if err != nil {
-			log.Fatal("invalid size for %s: %v", envKey, err)
-		}
-		return b
-	}
-	if v := os.Getenv(envKey); v != "" {
-		b, err := units.ParseSize(v)
-		if err != nil {
-			log.Fatal("invalid size in %s: %v", envKey, err)
-		}
-		return b
 	}
 	return def
 }

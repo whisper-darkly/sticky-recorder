@@ -1,6 +1,7 @@
 package recorder
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -35,14 +37,12 @@ type Config struct {
 	ExecArgs   []string // Command + args to run on finished segments ({} = file path)
 	ExecFatal  bool     // If true, non-zero exec exit kills the session
 
-	SegmentLength time.Duration // Max segment duration (0 = no limit)
-	SegmentSize   int64         // Max segment size in bytes (0 = no limit)
+	SegmentLength time.Duration // Max segment duration (0 = no splitting)
 
 	RetryDelay       time.Duration // Delay between retry attempts
 	SegmentTimeout   time.Duration // Reconnect within this = same recording, new segment
 	RecordingTimeout time.Duration // Reconnect within this = new recording in same session
 	CheckInterval    time.Duration // Watch mode interval (0 = one-shot, exit on offline/end)
-	ShortPaths       bool          // If true, emit only filenames in events instead of full paths
 
 	Log *logger.Logger
 }
@@ -58,8 +58,6 @@ type Recorder struct {
 
 	// Current recording state
 	recordingStart time.Time
-	segmentCount   int
-	segmentStart   time.Time
 
 	// Cookie selected for the current connection
 	activeCookies string
@@ -67,6 +65,16 @@ type Recorder struct {
 	// Log file handle (if any)
 	logFile *os.File
 }
+
+// segmentedResult holds the outcome of a single ffmpeg segment muxer run.
+type segmentedResult struct {
+	err       error
+	execFatal bool
+	segCount  int // total segments produced (completed + final in-progress)
+}
+
+// kv is a shorthand for logger.KV.
+func kv(key, value string) logger.KV { return logger.KV{Key: key, Value: value} }
 
 // New creates a Recorder with the given config.
 func New(cfg Config) *Recorder {
@@ -97,8 +105,9 @@ func (r *Recorder) Run(ctx context.Context) int {
 			return exitCode // fatal/blocked: stop watching
 		}
 		// offline or session ended: sleep and retry
-		r.log.Event("SLEEP source=%s interval=%s",
-			r.cfg.Source, units.FormatDuration(r.cfg.CheckInterval))
+		r.log.Event("SLEEP",
+			kv("source", r.cfg.Source),
+			kv("interval", units.FormatDuration(r.cfg.CheckInterval)))
 		select {
 		case <-time.After(r.cfg.CheckInterval):
 		case <-ctx.Done():
@@ -144,13 +153,17 @@ func (r *Recorder) runSession(ctx context.Context) int {
 		defer r.closeLogFile()
 	}
 
-	r.log.Event("SESSION START source=%s driver=%s resolution=%dp/%dfps",
-		r.cfg.Source, r.cfg.Driver.Name(), info.Resolution, info.Framerate)
+	r.log.Event("SESSION START",
+		kv("source", r.cfg.Source),
+		kv("driver", r.cfg.Driver.Name()),
+		kv("resolution", fmt.Sprintf("%dp/%dfps", info.Resolution, info.Framerate)))
 
 	exitCode := r.sessionLoop(ctx, info)
 
-	r.log.Event("SESSION END source=%s recordings=%d duration=%s",
-		r.cfg.Source, r.recordingCount, units.FormatDuration(time.Since(r.sessionStart)))
+	r.log.Event("SESSION END",
+		kv("source", r.cfg.Source),
+		kv("recordings", fmt.Sprintf("%d", r.recordingCount)),
+		kv("duration", units.FormatDuration(time.Since(r.sessionStart))))
 
 	return exitCode
 }
@@ -213,105 +226,136 @@ func (r *Recorder) sessionLoop(ctx context.Context, initialInfo *stream.StreamIn
 	}
 }
 
-// runRecording manages a single recording (one or more segments).
+// runRecording manages a single recording.
 // Returns >=0 for a final exit code, or -1 to signal "try for a new recording."
 func (r *Recorder) runRecording(ctx context.Context, info *stream.StreamInfo) int {
 	r.recordingStart = time.Now()
-	r.segmentCount = 0
 	r.recordingCount++
 
-	r.log.Event("RECORDING START recording=%d resolution=%dp/%dfps",
-		r.recordingCount-1, info.Resolution, info.Framerate)
+	r.log.Event("RECORDING START",
+		kv("recording", fmt.Sprintf("%d", r.recordingCount-1)),
+		kv("resolution", fmt.Sprintf("%dp/%dfps", info.Resolution, info.Framerate)))
 
+	// Use ffmpeg segment muxer for time-based splitting
+	if r.cfg.SegmentLength > 0 {
+		return r.runSegmentedRecording(ctx, info)
+	}
+
+	return r.runSingleFile(ctx, info)
+}
+
+// runSingleFile records to a single file (no splitting).
+func (r *Recorder) runSingleFile(ctx context.Context, info *stream.StreamInfo) int {
+	segmentCount := 0
 	for {
 		if ctx.Err() != nil {
 			return 0
 		}
 
-		_, segErr := r.runSegment(ctx, info)
+		segStart := time.Now()
+		outFile, ffmpegErr := r.runSingleFFmpeg(ctx, info)
+		segmentCount++
 
-		if segErr == nil {
-			// Segment limit reached — next segment
-			continue
+		// Emit segment events even in single-file mode
+		var fileSize int64
+		if outFile != "" {
+			if fi, err := os.Stat(outFile); err == nil {
+				fileSize = fi.Size()
+			}
 		}
 
-		// Exec killed the session
-		if errors.Is(segErr, ErrExecFatal) {
-			r.log.Event("RECORDING END recording=%d segments=%d duration=%s trigger=exec_fatal",
-				r.recordingCount-1, r.segmentCount,
-				units.FormatDuration(time.Since(r.recordingStart)))
-			return 1
+		if outFile != "" {
+			r.log.Event("SEGMENT START",
+				kv("file", outFile),
+				kv("segment", fmt.Sprintf("%d", segmentCount-1)),
+				kv("recording", fmt.Sprintf("%d", r.recordingCount-1)))
+
+			trigger := "stream_end"
+			if ffmpegErr != nil {
+				if ctx.Err() != nil {
+					trigger = "cancelled"
+				} else {
+					trigger = "error"
+				}
+			}
+
+			elapsed := time.Since(segStart)
+			r.log.Event("SEGMENT FINISH",
+				kv("file", outFile),
+				kv("segment", fmt.Sprintf("%d", segmentCount-1)),
+				kv("recording", fmt.Sprintf("%d", r.recordingCount-1)),
+				kv("duration", units.FormatDuration(elapsed)),
+				kv("size", formatBytes(fileSize)),
+				kv("trigger", trigger))
 		}
 
-		itype := r.cfg.Driver.ClassifyError(segErr)
+		// Run exec on the file
+		if fileSize > 0 && len(r.cfg.ExecArgs) > 0 {
+			if execErr := r.runExec(outFile); execErr != nil {
+				r.log.Event("RECORDING END",
+					kv("recording", fmt.Sprintf("%d", r.recordingCount-1)),
+					kv("segments", fmt.Sprintf("%d", segmentCount)),
+					kv("duration", units.FormatDuration(time.Since(r.recordingStart))),
+					kv("trigger", "exec_fatal"))
+				return 1
+			}
+		}
+
+		if ffmpegErr == nil {
+			r.log.Event("RECORDING END",
+				kv("recording", fmt.Sprintf("%d", r.recordingCount-1)),
+				kv("segments", fmt.Sprintf("%d", segmentCount)),
+				kv("duration", units.FormatDuration(time.Since(r.recordingStart))),
+				kv("trigger", "stream_end"))
+			return -1
+		}
+
+		if ctx.Err() != nil {
+			r.log.Event("RECORDING END",
+				kv("recording", fmt.Sprintf("%d", r.recordingCount-1)),
+				kv("segments", fmt.Sprintf("%d", segmentCount)),
+				kv("duration", units.FormatDuration(time.Since(r.recordingStart))),
+				kv("trigger", "cancelled"))
+			return 0
+		}
+
+		itype := r.cfg.Driver.ClassifyError(ffmpegErr)
 		if itype == stream.Blocked || itype == stream.TransientError {
 			r.penalizeCookie()
 		}
 		if itype == stream.Blocked {
-			r.log.Error("blocked: %v", segErr)
+			r.log.Error("blocked: %v", ffmpegErr)
 			return 3
 		}
 		if itype == stream.Fatal {
-			r.log.Error("fatal: %v", segErr)
+			r.log.Error("fatal: %v", ffmpegErr)
 			return 1
 		}
 
 		// Ended or TransientError: try reconnecting within segment-timeout
-		deadline := time.Now().Add(r.cfg.SegmentTimeout)
-		reconnected := false
-		for time.Now().Before(deadline) {
-			if ctx.Err() != nil {
-				return 0
-			}
-
-			select {
-			case <-time.After(r.cfg.RetryDelay):
-			case <-ctx.Done():
-				return 0
-			}
-
-			newInfo, err := r.cfg.Driver.CheckStream(ctx, r.streamOpts())
-			if err == nil {
-				info = newInfo
-				reconnected = true
-				break
-			}
-
-			it := r.cfg.Driver.ClassifyError(err)
-			if it == stream.Blocked {
-				r.penalizeCookie()
-				r.log.Error("%v (not retrying)", err)
-				return 3
-			}
-			if it == stream.Fatal {
-				r.log.Error("%v (not retrying)", err)
-				return 1
-			}
-			r.log.Debug("reconnecting: %v (until %s)", err, deadline.Format("15:04:05"))
+		info = r.reconnect(ctx, info)
+		if info == nil {
+			r.log.Event("RECORDING END",
+				kv("recording", fmt.Sprintf("%d", r.recordingCount-1)),
+				kv("segments", fmt.Sprintf("%d", segmentCount)),
+				kv("duration", units.FormatDuration(time.Since(r.recordingStart))),
+				kv("trigger", "timeout"))
+			return -1
 		}
-
-		if !reconnected {
-			r.log.Event("RECORDING END recording=%d segments=%d duration=%s trigger=timeout",
-				r.recordingCount-1, r.segmentCount,
-				units.FormatDuration(time.Since(r.recordingStart)))
-			return -1 // try for new recording within session
-		}
-		// Reconnected — continue with new segment
 	}
 }
 
-// runSegment records a single segment via ffmpeg. Returns the output file path and any error.
-func (r *Recorder) runSegment(ctx context.Context, info *stream.StreamInfo) (string, error) {
-	r.segmentStart = time.Now()
-
+// runSingleFFmpeg records to a single file and returns the output path and any error.
+func (r *Recorder) runSingleFFmpeg(ctx context.Context, info *stream.StreamInfo) (string, error) {
 	tmplData := NewTemplateData(
 		r.cfg.Source, r.cfg.Driver.Name(),
-		r.sessionStart, r.recordingStart, r.segmentStart,
-		r.recordingCount-1, r.segmentCount,
+		r.sessionStart, r.recordingStart, time.Now(),
+		r.recordingCount-1, 0,
 	)
 
 	outBase, err := RenderTemplate(r.cfg.OutPattern, tmplData)
 	if err != nil {
+		r.log.Error("render output template: %v", err)
 		return "", fmt.Errorf("render output template: %w", err)
 	}
 	outFile := outBase + "." + r.cfg.Driver.FileExtension()
@@ -320,59 +364,374 @@ func (r *Recorder) runSegment(ctx context.Context, info *stream.StreamInfo) (str
 		return "", fmt.Errorf("create output directory: %w", err)
 	}
 
-	r.segmentCount++
-	targetInfo := r.segmentTargetInfo()
+	r.log.Info("recording to %s", outFile)
 
-	r.emitSegmentStart(outFile, targetInfo)
+	args := r.ffmpegInputArgs(info.URL, "warning")
+	args = append(args,
+		"-c", "copy",
+		"-copyts", "-start_at_zero",
+		"-muxdelay", "0", "-muxpreload", "0",
+		outFile,
+	)
 
-	ffmpegErr := r.runFFmpeg(ctx, info.URL, outFile)
-	elapsed := time.Since(r.segmentStart)
+	r.log.Debug("ffmpeg %s", strings.Join(args, " "))
 
-	var fileSize int64
-	if fi, err := os.Stat(outFile); err == nil {
-		fileSize = fi.Size()
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Stderr = r.log.Writer(logger.LevelDebug)
+
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("start ffmpeg: %w", err)
 	}
 
-	if fileSize == 0 {
+	ffmpegErr := cmd.Wait()
+
+	// Remove empty files
+	if fi, err := os.Stat(outFile); err == nil && fi.Size() == 0 {
 		os.Remove(outFile)
+		return "", ffmpegErr
 	}
 
-	trigger := "stream_end"
-	if ffmpegErr != nil {
-		if ctx.Err() != nil {
-			trigger = "cancelled"
-		} else {
-			trigger = "error"
-		}
-	} else if r.shouldSplit(elapsed, fileSize) {
-		trigger = "split"
-	}
-
-	r.emitSegmentFinish(outFile, targetInfo, elapsed, fileSize, trigger, ffmpegErr)
-
-	// Run exec and check return code
-	if fileSize > 0 && len(r.cfg.ExecArgs) > 0 {
-		if execErr := r.runExec(outFile); execErr != nil {
-			return outFile, execErr
-		}
-	}
-
-	if ffmpegErr != nil && ctx.Err() == nil {
-		return outFile, ffmpegErr
-	}
-	if ctx.Err() != nil {
-		return outFile, ctx.Err()
-	}
-	if trigger == "split" {
-		return outFile, nil
-	}
-	return outFile, stream.ErrOffline
+	return outFile, ffmpegErr
 }
 
-// runFFmpeg launches ffmpeg and blocks until it exits or a split limit is reached.
-func (r *Recorder) runFFmpeg(ctx context.Context, streamURL, outFile string) error {
+// --- Segmented recording (ffmpeg -f segment muxer) ---
+
+// runSegmentedRecording uses ffmpeg's segment muxer for glitch-free time-based splitting.
+// One ffmpeg process handles all splits internally — the stream connection stays alive.
+// Segment events are tracked in real time via stderr (SEGMENT START) and stdout (SEGMENT FINISH).
+func (r *Recorder) runSegmentedRecording(ctx context.Context, info *stream.StreamInfo) int {
+	totalSegments := 0
+
+	for {
+		if ctx.Err() != nil {
+			return 0
+		}
+
+		// Render base path for this recording's segments
+		tmplData := NewTemplateData(
+			r.cfg.Source, r.cfg.Driver.Name(),
+			r.sessionStart, r.recordingStart, time.Now(),
+			r.recordingCount-1, 0,
+		)
+		outBase, err := RenderTemplate(r.cfg.OutPattern, tmplData)
+		if err != nil {
+			r.log.Error("render output template: %v", err)
+			return 1
+		}
+
+		ext := r.cfg.Driver.FileExtension()
+		if err := os.MkdirAll(filepath.Dir(outBase), 0755); err != nil {
+			r.log.Error("create output directory: %v", err)
+			return 1
+		}
+
+		// ffmpeg writes: outBase_00000.ext, outBase_00001.ext, ...
+		segPattern := outBase + "_%05d." + ext
+
+		result := r.runFFmpegSegmented(ctx, info.URL, segPattern, ext, totalSegments, outBase)
+		totalSegments += result.segCount
+
+		if result.execFatal {
+			r.log.Event("RECORDING END",
+				kv("recording", fmt.Sprintf("%d", r.recordingCount-1)),
+				kv("segments", fmt.Sprintf("%d", totalSegments)),
+				kv("duration", units.FormatDuration(time.Since(r.recordingStart))),
+				kv("trigger", "exec_fatal"))
+			return 1
+		}
+
+		if result.err == nil || ctx.Err() != nil {
+			trigger := "stream_end"
+			if ctx.Err() != nil {
+				trigger = "cancelled"
+			}
+			r.log.Event("RECORDING END",
+				kv("recording", fmt.Sprintf("%d", r.recordingCount-1)),
+				kv("segments", fmt.Sprintf("%d", totalSegments)),
+				kv("duration", units.FormatDuration(time.Since(r.recordingStart))),
+				kv("trigger", trigger))
+			if ctx.Err() != nil {
+				return 0
+			}
+			return -1
+		}
+
+		// Error: classify and maybe reconnect
+		itype := r.cfg.Driver.ClassifyError(result.err)
+		if itype == stream.Blocked || itype == stream.TransientError {
+			r.penalizeCookie()
+		}
+		if itype == stream.Blocked {
+			r.log.Error("blocked: %v", result.err)
+			return 3
+		}
+		if itype == stream.Fatal {
+			r.log.Error("fatal: %v", result.err)
+			return 1
+		}
+
+		// Try reconnecting
+		info = r.reconnect(ctx, info)
+		if info == nil {
+			r.log.Event("RECORDING END",
+				kv("recording", fmt.Sprintf("%d", r.recordingCount-1)),
+				kv("segments", fmt.Sprintf("%d", totalSegments)),
+				kv("duration", units.FormatDuration(time.Since(r.recordingStart))),
+				kv("trigger", "timeout"))
+			return -1
+		}
+		// Reconnected: loop back, start new ffmpeg with continued segment numbering
+	}
+}
+
+// runFFmpegSegmented launches ffmpeg with -f segment and monitors segment progress
+// in real time via stderr (Opening lines → SEGMENT START) and stdout (segment_list → SEGMENT FINISH).
+func (r *Recorder) runFFmpegSegmented(ctx context.Context, streamURL, segPattern, ext string, startNumber int, outBase string) segmentedResult {
+	args := r.ffmpegInputArgs(streamURL, "info")
+	args = append(args,
+		"-c", "copy",
+		"-avoid_negative_ts", "make_zero",
+		"-muxdelay", "0", "-muxpreload", "0",
+		"-f", "segment",
+		"-segment_time", fmt.Sprintf("%d", int(r.cfg.SegmentLength.Seconds())),
+		"-segment_format", segmentFormat(ext),
+		"-reset_timestamps", "1",
+		"-segment_start_number", fmt.Sprintf("%d", startNumber),
+		"-segment_list", "pipe:1",
+		"-segment_list_type", "flat",
+		segPattern,
+	)
+
+	r.log.Debug("ffmpeg %s", strings.Join(args, " "))
+
+	cmd := exec.Command("ffmpeg", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return segmentedResult{err: fmt.Errorf("stdout pipe: %w", err)}
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return segmentedResult{err: fmt.Errorf("stderr pipe: %w", err)}
+	}
+
+	if err := cmd.Start(); err != nil {
+		return segmentedResult{err: fmt.Errorf("start ffmpeg: %w", err)}
+	}
+
+	// Graceful shutdown: SIGTERM → wait → SIGKILL (instead of Go's default instant SIGKILL)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			terminateProcess(cmd)
+		case <-done:
+		}
+	}()
+
+	// Shared state between goroutines
+	var mu sync.Mutex
+	segStarts := make(map[string]time.Time) // file path → start time
+	var lastOpenedFile string
+	var stderrSegCount int   // segments seen via stderr (Opening lines)
+	var stdoutSegCount int   // segments completed via stdout (segment_list)
+	var execFatal bool
+	ffmpegStarted := time.Now()
+
+	completedFiles := make(map[string]bool) // files reported by stdout
+
+	var wg sync.WaitGroup
+
+	// Expected base filename for filtering stderr Opening lines
+	outBaseFile := filepath.Base(outBase)
+
+	outDir := filepath.Dir(outBase)
+	recNum := fmt.Sprintf("%d", r.recordingCount-1)
+	targetDur := units.FormatDuration(r.cfg.SegmentLength)
+
+	// stderr goroutine: parse [segment @] Opening lines → SEGMENT START
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stderr)
+		logWriter := r.log.Writer(logger.LevelDebug)
+		for scanner.Scan() {
+			line := scanner.Text()
+
+			if file := parseSegmentOpening(line); file != "" && strings.Contains(filepath.Base(file), outBaseFile) {
+				mu.Lock()
+				segNum := startNumber + stderrSegCount
+				segStarts[file] = time.Now()
+				lastOpenedFile = file
+				stderrSegCount++
+				mu.Unlock()
+
+				r.log.Event("SEGMENT START",
+					kv("file", file),
+					kv("segment", fmt.Sprintf("%d", segNum)),
+					kv("recording", recNum),
+					kv("target_duration", targetDur))
+			} else {
+				// Capture but only show at debug level
+				fmt.Fprintln(logWriter, line)
+			}
+		}
+	}()
+
+	// stdout goroutine: completed segment filenames → SEGMENT FINISH + --exec
+	// Note: ffmpeg segment_list outputs bare filenames (no directory),
+	// so we resolve them to full paths using the output directory.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			name := strings.TrimSpace(scanner.Text())
+			if name == "" {
+				continue
+			}
+
+			// Resolve to full path if not already absolute
+			file := name
+			if !filepath.IsAbs(file) {
+				file = filepath.Join(outDir, file)
+			}
+
+			mu.Lock()
+			segNum := startNumber + stdoutSegCount
+			start, hasStart := segStarts[file]
+			if !hasStart {
+				start = ffmpegStarted
+			}
+			completedFiles[file] = true
+			stdoutSegCount++
+			mu.Unlock()
+
+			elapsed := time.Since(start)
+			var fileSize int64
+			if fi, err := os.Stat(file); err == nil {
+				fileSize = fi.Size()
+			}
+
+			trigger := "split"
+			if ctx.Err() != nil {
+				trigger = "cancelled"
+			}
+
+			r.log.Event("SEGMENT FINISH",
+				kv("file", file),
+				kv("segment", fmt.Sprintf("%d", segNum)),
+				kv("recording", recNum),
+				kv("duration", units.FormatDuration(elapsed)),
+				kv("size", formatBytes(fileSize)),
+				kv("trigger", trigger))
+
+			if fileSize > 0 && len(r.cfg.ExecArgs) > 0 {
+				if execErr := r.runExec(file); execErr != nil {
+					mu.Lock()
+					execFatal = true
+					mu.Unlock()
+					terminateProcess(cmd)
+					return
+				}
+			}
+		}
+	}()
+
+	waitErr := cmd.Wait()
+	close(done)
+	wg.Wait()
+
+	mu.Lock()
+	lastFile := lastOpenedFile
+	lastStart := segStarts[lastFile]
+	isCompleted := completedFiles[lastFile]
+	totalSeg := stderrSegCount
+	fatal := execFatal
+	mu.Unlock()
+
+	// Finalize the last segment (the one being written when ffmpeg exited)
+	if lastFile != "" && !isCompleted && !fatal {
+		var fileSize int64
+		if fi, err := os.Stat(lastFile); err == nil {
+			fileSize = fi.Size()
+		}
+
+		if fileSize == 0 {
+			os.Remove(lastFile)
+		} else {
+			trigger := "stream_end"
+			if waitErr != nil {
+				if ctx.Err() != nil {
+					trigger = "cancelled"
+				} else {
+					trigger = "error"
+				}
+			}
+
+			if lastStart.IsZero() {
+				lastStart = ffmpegStarted
+			}
+			elapsed := time.Since(lastStart)
+			segNum := startNumber + totalSeg - 1
+
+			r.log.Event("SEGMENT FINISH",
+				kv("file", lastFile),
+				kv("segment", fmt.Sprintf("%d", segNum)),
+				kv("recording", recNum),
+				kv("duration", units.FormatDuration(elapsed)),
+				kv("size", formatBytes(fileSize)),
+				kv("trigger", trigger))
+
+			if fileSize > 0 && len(r.cfg.ExecArgs) > 0 {
+				if execErr := r.runExec(lastFile); execErr != nil {
+					fatal = true
+				}
+			}
+		}
+	}
+
+	return segmentedResult{
+		err:       waitErr,
+		execFatal: fatal,
+		segCount:  totalSeg,
+	}
+}
+
+// parseSegmentOpening extracts the filename from ffmpeg segment muxer log lines.
+// Input:  [segment @ 0x56d74ca4ff00] Opening './test_00009.ts' for writing
+// Output: ./test_00009.ts
+func parseSegmentOpening(line string) string {
+	const prefix = "] Opening '"
+	const suffix = "' for writing"
+	i := strings.Index(line, prefix)
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+len(prefix):]
+	j := strings.Index(rest, suffix)
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+// segmentFormat maps file extensions to ffmpeg segment format names.
+func segmentFormat(ext string) string {
+	if ext == "ts" {
+		return "mpegts"
+	}
+	return ext
+}
+
+// --- Common helpers ---
+
+// ffmpegInputArgs builds the common ffmpeg input arguments (before -c copy).
+func (r *Recorder) ffmpegInputArgs(streamURL, loglevel string) []string {
 	args := []string{
-		"-y", "-hide_banner", "-loglevel", "warning",
+		"-y", "-hide_banner", "-loglevel", loglevel,
 		"-reconnect", "1",
 		"-reconnect_on_network_error", "1",
 		"-reconnect_on_http_error", "1",
@@ -392,88 +751,43 @@ func (r *Recorder) runFFmpeg(ctx context.Context, streamURL, outFile string) err
 		args = append(args, "-headers", strings.Join(headers, "\r\n")+"\r\n")
 	}
 
-	args = append(args,
-		"-i", streamURL,
-		"-c", "copy",
-		"-copyts", "-start_at_zero",
-		outFile,
-	)
-
-	r.log.Debug("ffmpeg %s", strings.Join(args, " "))
-
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Stderr = r.log.Writer(logger.LevelWarn)
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start ffmpeg: %w", err)
-	}
-
-	splitCtx, splitCancel := context.WithCancel(ctx)
-	defer splitCancel()
-	splitTriggered := make(chan struct{}, 1)
-
-	if r.cfg.SegmentLength > 0 || r.cfg.SegmentSize > 0 {
-		go r.monitorSplit(splitCtx, outFile, cmd, splitTriggered)
-	}
-
-	err := cmd.Wait()
-
-	select {
-	case <-splitTriggered:
-		return nil
-	default:
-	}
-
-	return err
+	args = append(args, "-i", streamURL)
+	return args
 }
 
-// monitorSplit watches the output file and signals ffmpeg to stop when limits are reached.
-func (r *Recorder) monitorSplit(ctx context.Context, outFile string, cmd *exec.Cmd, triggered chan<- struct{}) {
-	start := time.Now()
-
-	maxDuration := r.cfg.SegmentLength
-	maxSize := r.cfg.SegmentSize
-
-	// Poll interval: 1 second, or 1/10th of the max duration if that's shorter
-	pollInterval := 1 * time.Second
-	if maxDuration > 0 && maxDuration/10 < pollInterval {
-		pollInterval = maxDuration / 10
-		if pollInterval < 100*time.Millisecond {
-			pollInterval = 100 * time.Millisecond
+// reconnect tries to reconnect within the segment timeout window.
+// Returns new StreamInfo on success, nil on timeout.
+func (r *Recorder) reconnect(ctx context.Context, current *stream.StreamInfo) *stream.StreamInfo {
+	deadline := time.Now().Add(r.cfg.SegmentTimeout)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return nil
 		}
-	}
 
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
-
-	for {
 		select {
+		case <-time.After(r.cfg.RetryDelay):
 		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			shouldSplit := false
-
-			if maxDuration > 0 && time.Since(start) >= maxDuration {
-				shouldSplit = true
-			}
-			if maxSize > 0 {
-				if fi, err := os.Stat(outFile); err == nil && fi.Size() >= maxSize {
-					shouldSplit = true
-				}
-			}
-
-			if shouldSplit {
-				r.log.Debug("segment limit reached, splitting")
-				select {
-				case triggered <- struct{}{}:
-				default:
-				}
-				terminateProcess(cmd)
-				return
-			}
+			return nil
 		}
+
+		newInfo, err := r.cfg.Driver.CheckStream(ctx, r.streamOpts())
+		if err == nil {
+			return newInfo
+		}
+
+		it := r.cfg.Driver.ClassifyError(err)
+		if it == stream.Blocked {
+			r.penalizeCookie()
+			r.log.Error("%v (not retrying)", err)
+			return nil
+		}
+		if it == stream.Fatal {
+			r.log.Error("%v (not retrying)", err)
+			return nil
+		}
+		r.log.Debug("reconnecting: %v (until %s)", err, deadline.Format("15:04:05"))
 	}
+	return nil
 }
 
 // terminateProcess sends SIGTERM then SIGKILL to the ffmpeg process group.
@@ -491,27 +805,11 @@ func terminateProcess(cmd *exec.Cmd) {
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
 }
 
-func (r *Recorder) shouldSplit(elapsed time.Duration, fileSize int64) bool {
-	if r.cfg.SegmentLength > 0 && elapsed >= r.cfg.SegmentLength {
-		return true
-	}
-	if r.cfg.SegmentSize > 0 && fileSize >= r.cfg.SegmentSize {
-		return true
-	}
-	return false
-}
-
-// runExec executes the configured command with {} replaced by the segment file
-// path in each argument token, matching find(1) -exec behavior:
-//   - Direct execution (no shell)
-//   - {} is replaced everywhere it appears in each argument (including substrings)
-//
-// Returns ErrExecFatal if the command exits non-zero and ExecFatal is enabled.
-// Returns nil otherwise (non-zero exit is logged as a warning but not fatal).
-func (r *Recorder) runExec(segmentFile string) error {
+// runExec executes the configured command with {} replaced by the file path.
+func (r *Recorder) runExec(file string) error {
 	args := make([]string, len(r.cfg.ExecArgs))
 	for i, a := range r.cfg.ExecArgs {
-		args[i] = strings.ReplaceAll(a, "{}", segmentFile)
+		args[i] = strings.ReplaceAll(a, "{}", file)
 	}
 
 	r.log.Info("exec: %s", strings.Join(args, " "))
@@ -528,55 +826,6 @@ func (r *Recorder) runExec(segmentFile string) error {
 		r.log.Warn("exec failed: %v", err)
 	}
 	return nil
-}
-
-// --- Segment event helpers ---
-
-func (r *Recorder) segmentTargetInfo() string {
-	var parts []string
-	if r.cfg.SegmentLength > 0 {
-		parts = append(parts, fmt.Sprintf("target_duration=%s",
-			units.FormatDuration(r.cfg.SegmentLength)))
-	}
-	if r.cfg.SegmentSize > 0 {
-		parts = append(parts, fmt.Sprintf("target_size=%s",
-			units.FormatSize(r.cfg.SegmentSize)))
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return strings.Join(parts, " ")
-}
-
-func (r *Recorder) displayPath(file string) string {
-	if r.cfg.ShortPaths {
-		return filepath.Base(file)
-	}
-	return file
-}
-
-func (r *Recorder) emitSegmentStart(file, targetInfo string) {
-	msg := fmt.Sprintf("SEGMENT START file=%s segment=%d recording=%d",
-		r.displayPath(file), r.segmentCount-1, r.recordingCount-1)
-	if targetInfo != "" {
-		msg += " " + targetInfo
-	}
-	r.log.Event(msg)
-}
-
-func (r *Recorder) emitSegmentFinish(file, targetInfo string, elapsed time.Duration, size int64, trigger string, ffmpegErr error) {
-	msg := fmt.Sprintf("SEGMENT FINISH file=%s segment=%d recording=%d duration=%s size=%s trigger=%s",
-		r.displayPath(file), r.segmentCount-1, r.recordingCount-1,
-		units.FormatDuration(elapsed),
-		formatBytes(size),
-		trigger)
-	if targetInfo != "" {
-		msg += " " + targetInfo
-	}
-	if ffmpegErr != nil && trigger == "error" {
-		msg += fmt.Sprintf(" error=%v", ffmpegErr)
-	}
-	r.log.Event(msg)
 }
 
 // --- Log file management ---
