@@ -39,7 +39,7 @@ func main() {
 domain := flag.String("domain", "", "Override platform domain URL")
 	cookies := flag.StringP("cookies", "c", envOrDefault("STICKY_COOKIES", ""), "HTTP cookies (format: key=value; key2=value2)")
 	userAgent := flag.StringP("user-agent", "a", envOrDefault("STICKY_USER_AGENT", ""), "Custom User-Agent header")
-	outPattern := flag.StringP("out", "o", "", "Output file path template (required, extension added by driver)")
+	outPattern := flag.StringP("out", "o", envOrDefault("STICKY_OUT", ""), "Output file path template (required, extension added by driver)")
 	logPattern := flag.String("log", envOrDefault("STICKY_LOG", ""), "Log file path template (empty=stdout only)")
 	logLevel := flag.String("log-level", envOrDefault("STICKY_LOG_LEVEL", "info"), "Log level: debug, info, warn, error, fatal")
 	outputFormat := flag.String("output-format", envOrDefault("STICKY_OUTPUT_FORMAT", "normal"), "Output format: normal, json")
