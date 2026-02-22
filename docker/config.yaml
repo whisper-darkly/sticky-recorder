@@ -1,0 +1,64 @@
+listen: ":8080"
+db: /data/overseer.db
+
+task_pool:
+  size: 8
+
+actions:
+  chaturbate:
+    type: exec
+    dedupe_key: ["source"]
+    retry:
+      restart_delay: "30s"
+      error_threshold: 0
+      error_window: "0s"
+    config:
+      entrypoint: sticky-recorder
+      command:
+        - "-d"
+        - "chaturbate"
+        - "-s"
+        - "[[.source]]"
+        - "-o"
+        - "/data/recordings/[[.source]]/[[.source]].ts"
+        - "--check-interval"
+        - "0"
+        - "--output-format"
+        - "json"
+      parameters:
+        source:
+          description: "Chaturbate username"
+      output:
+        stdout:
+          condition: "has(output.json.event)"
+        stderr:
+          condition: "false"
+
+  stripchat:
+    type: exec
+    dedupe_key: ["source"]
+    retry:
+      restart_delay: "30s"
+      error_threshold: 0
+      error_window: "0s"
+    config:
+      entrypoint: sticky-recorder
+      command:
+        - "-d"
+        - "stripchat"
+        - "-s"
+        - "[[.source]]"
+        - "-o"
+        - "/data/recordings/[[.source]]/[[.source]].ts"
+        - "--check-interval"
+        - "0"
+        - "--output-format"
+        - "json"
+      parameters:
+        source:
+          description: "StripChat username"
+      output:
+        stdout:
+          condition: "has(output.json.event)"
+        stderr:
+          condition: "false"

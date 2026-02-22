@@ -7,6 +7,7 @@ ARG STICKY_OVERSEER_REPO
 ARG STICKY_OVERSEER_REF
 
 RUN apk add --no-cache git make
+RUN go install github.com/swaggo/swag/cmd/swag@latest
 
 # Build sticky-recorder from the repo root (mounted as build context)
 WORKDIR /src/sticky-recorder
@@ -29,8 +30,10 @@ FROM alpine:3.21
 RUN apk add --no-cache ffmpeg
 
 COPY --from=builder /out/bin/ /usr/local/bin/
+COPY --from=builder /src/sticky-recorder/docker/config.yaml /etc/sticky-overseer/config.yaml
 
 # sticky-overseer
+ENV OVERSEER_CONFIG=/etc/sticky-overseer/config.yaml
 ENV OVERSEER_PORT=8080
 ENV OVERSEER_TRUSTED_CIDRS=""
 ENV OVERSEER_LOG_FILE=/data/overseer.jsonl
@@ -62,4 +65,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD wget -qO- http://localhost:${OVERSEER_PORT}/ws 2>&1 | grep -q "400 Bad Request" || exit 1
 
-CMD ["sticky-overseer", "-command", "sticky-recorder"]
+CMD ["sticky-overseer"]
