@@ -1,3 +1,4 @@
+name: "sticky-recorder"
 listen: ":8080"
 db: /data/overseer.db
 
