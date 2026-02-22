@@ -3,7 +3,10 @@ listen: ":8080"
 db: /data/overseer.db
 
 task_pool:
-  size: 8
+  limit: 8
+  queue:
+    enabled: true
+    size: 100
 
 actions:
   chaturbate:
@@ -20,15 +23,32 @@ actions:
         - "chaturbate"
         - "-s"
         - "[[.source]]"
+        - "-r"
+        - "[[.resolution]]"
+        - "-f"
+        - "[[.framerate]]"
+        - "-c"
+        - "[[.cookies]]"
+        - "-a"
+        - "[[.user_agent]]"
         - "-o"
-        - "/data/recordings/[[.source]]/[[.source]].ts"
-        - "--check-interval"
-        - "0"
+        - "/data/recordings/{{.Driver}}/{{.Source}}/{{.Session.Year}}-{{.Session.Month}}-{{.Session.Day}}_{{.Session.Hour}}-{{.Session.Minute}}-{{.Session.Second}}/{{.Recording.Year}}-{{.Recording.Month}}-{{.Recording.Day}}_{{.Recording.Hour}}-{{.Recording.Minute}}-{{.Recording.Second}}"
+        - "-i"
+        - "1m"
         - "--output-format"
         - "json"
       parameters:
-        source:
-          description: "Chaturbate username"
+        source: {}
+        resolution:
+          default: "1080"
+          validate: 'value in ["480", "720", "1080"]'
+        framerate:
+          default: "30"
+          validate: 'value in ["30", "60"]'
+        cookies:
+          default: ""
+        user_agent:
+          default: ""
       output:
         stdout:
           condition: "has(output.json.event)"
@@ -49,15 +69,32 @@ actions:
         - "stripchat"
         - "-s"
         - "[[.source]]"
+        - "-r"
+        - "[[.resolution]]"
+        - "-f"
+        - "[[.framerate]]"
+        - "-c"
+        - "[[.cookies]]"
+        - "-a"
+        - "[[.user_agent]]"
         - "-o"
-        - "/data/recordings/[[.source]]/[[.source]].ts"
-        - "--check-interval"
-        - "0"
+        - "/data/recordings/{{.Driver}}/{{.Source}}/{{.Session.Year}}-{{.Session.Month}}-{{.Session.Day}}_{{.Session.Hour}}-{{.Session.Minute}}-{{.Session.Second}}/{{.Recording.Year}}-{{.Recording.Month}}-{{.Recording.Day}}_{{.Recording.Hour}}-{{.Recording.Minute}}-{{.Recording.Second}}"
+        - "-i"
+        - "1m"
         - "--output-format"
         - "json"
       parameters:
-        source:
-          description: "StripChat username"
+        source: {}
+        resolution:
+          default: "1080"
+          validate: 'value in ["480", "720", "1080"]'
+        framerate:
+          default: "30"
+          validate: 'value in ["30", "60"]'
+        cookies:
+          default: ""
+        user_agent:
+          default: ""
       output:
         stdout:
           condition: "has(output.json.event)"
