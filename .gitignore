@@ -13,3 +13,6 @@ sticky-recorder
 # OS
 .DS_Store
 Thumbs.db
+
+# Job queue
+jobs/
