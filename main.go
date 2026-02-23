@@ -43,10 +43,14 @@ domain := flag.String("domain", "", "Override platform domain URL")
 	logPattern := flag.String("log", envOrDefault("STICKY_LOG", ""), "Log file path template (empty=stdout only)")
 	logLevel := flag.String("log-level", envOrDefault("STICKY_LOG_LEVEL", "info"), "Log level: debug, info, warn, error, fatal")
 	outputFormat := flag.String("output-format", envOrDefault("STICKY_OUTPUT_FORMAT", "normal"), "Output format: normal, json")
-	retryDelay := flag.String("retry-delay", "", "Retry delay (default 00:00:05, e.g. 5s, 00:00:05)")
+	retryDelay := flag.String("retry-delay", "", "Base retry delay (default 00:00:05, e.g. 5s, 00:00:05)")
+	retryMaxDelay := flag.String("retry-max-delay", "", "Max retry delay cap for exponential backoff (0=disabled, e.g. 60s, 00:01:00)")
+	retryJitter := flag.String("retry-jitter", "", "Max random jitter added to each retry delay (0=disabled, e.g. 2s)")
 	segmentTimeout := flag.String("segment-timeout", "", "Same-recording reconnect window (default 00:05:00, e.g. 5m)")
 	recordingTimeout := flag.String("recording-timeout", "", "New-recording reconnect window (default 00:30:00, e.g. 30m)")
 	checkInterval := flag.StringP("check-interval", "i", "", "Watch interval when offline (0=exit, e.g. 5m, 00:05:00)")
+	sleepJitter := flag.String("sleep-jitter", "", "Max random jitter added to check-interval sleep (0=disabled, e.g. 30s)")
+	heartbeatInterval := flag.String("heartbeat-interval", "", "Interval for HEARTBEAT JSON events during active segments (0=disabled, e.g. 30s)")
 
 	// This flag exists only for --help output. The actual parsing is done by
 	// extractExecArgs above. If find-style was not used (no ";"), pflag will
@@ -129,23 +133,27 @@ domain := flag.String("domain", "", "Override platform domain URL")
 	}
 
 	cfg := recorder.Config{
-		Driver:           drv,
-		Source:           *source,
-		Domain:           *domain,
-		Resolution:       intVal(*resolution, "STICKY_RESOLUTION", 720),
-		Framerate:        intVal(*framerate, "STICKY_FRAMERATE", 30),
-		CookiePool:       cookiePool,
-		UserAgent:        *userAgent,
-		OutPattern:       *outPattern,
-		LogPattern:       *logPattern,
-		ExecArgs:         execArgs,
-		ExecFatal:        os.Getenv("STICKY_EXEC_FATAL") != "",
-		SegmentLength:    durationVal(*segmentLength, "STICKY_SEGMENT_LENGTH", 0, log),
-		RetryDelay:       durationVal(*retryDelay, "STICKY_RETRY_DELAY", 5*time.Second, log),
-		SegmentTimeout:   durationVal(*segmentTimeout, "STICKY_SEGMENT_TIMEOUT", 5*time.Minute, log),
-		RecordingTimeout: durationVal(*recordingTimeout, "STICKY_RECORDING_TIMEOUT", 30*time.Minute, log),
-		CheckInterval:    durationVal(*checkInterval, "STICKY_CHECK_INTERVAL", 0, log),
-		Log:              log,
+		Driver:            drv,
+		Source:            *source,
+		Domain:            *domain,
+		Resolution:        intVal(*resolution, "STICKY_RESOLUTION", 720),
+		Framerate:         intVal(*framerate, "STICKY_FRAMERATE", 30),
+		CookiePool:        cookiePool,
+		UserAgent:         *userAgent,
+		OutPattern:        *outPattern,
+		LogPattern:        *logPattern,
+		ExecArgs:          execArgs,
+		ExecFatal:         os.Getenv("STICKY_EXEC_FATAL") != "",
+		SegmentLength:     durationVal(*segmentLength, "STICKY_SEGMENT_LENGTH", 0, log),
+		RetryDelay:        durationVal(*retryDelay, "STICKY_RETRY_DELAY", 5*time.Second, log),
+		RetryMaxDelay:     durationVal(*retryMaxDelay, "STICKY_RETRY_MAX_DELAY", 0, log),
+		RetryJitter:       durationVal(*retryJitter, "STICKY_RETRY_JITTER", 0, log),
+		SegmentTimeout:    durationVal(*segmentTimeout, "STICKY_SEGMENT_TIMEOUT", 5*time.Minute, log),
+		RecordingTimeout:  durationVal(*recordingTimeout, "STICKY_RECORDING_TIMEOUT", 30*time.Minute, log),
+		CheckInterval:     durationVal(*checkInterval, "STICKY_CHECK_INTERVAL", 0, log),
+		SleepJitter:       durationVal(*sleepJitter, "STICKY_SLEEP_JITTER", 0, log),
+		HeartbeatInterval: durationVal(*heartbeatInterval, "STICKY_HEARTBEAT_INTERVAL", 0, log),
+		Log:               log,
 	}
 
 	rec := recorder.New(cfg)

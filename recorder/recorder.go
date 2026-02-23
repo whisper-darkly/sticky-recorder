@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,10 +40,14 @@ type Config struct {
 
 	SegmentLength time.Duration // Max segment duration (0 = no splitting)
 
-	RetryDelay       time.Duration // Delay between retry attempts
+	RetryDelay       time.Duration // Base delay between retry attempts
+	RetryMaxDelay    time.Duration // Max retry delay cap for exponential backoff (0 = no cap)
+	RetryJitter      time.Duration // Max random jitter added to each retry delay (0 = disabled)
 	SegmentTimeout   time.Duration // Reconnect within this = same recording, new segment
 	RecordingTimeout time.Duration // Reconnect within this = new recording in same session
 	CheckInterval    time.Duration // Watch mode interval (0 = one-shot, exit on offline/end)
+	SleepJitter      time.Duration // Max random jitter added to CheckInterval sleep (0 = disabled)
+	HeartbeatInterval time.Duration // Interval for HEARTBEAT events (0 = disabled)
 
 	Log *logger.Logger
 }
@@ -94,6 +99,25 @@ func New(cfg Config) *Recorder {
 	}
 }
 
+// retryDelay computes the delay for a retry attempt using exponential backoff
+// (if RetryMaxDelay > 0) and adds a random jitter in [0, RetryJitter).
+func (r *Recorder) retryDelay(attempt int) time.Duration {
+	delay := r.cfg.RetryDelay
+	if r.cfg.RetryMaxDelay > 0 && attempt > 0 {
+		for i := 0; i < attempt; i++ {
+			delay *= 2
+			if delay >= r.cfg.RetryMaxDelay || delay < 0 { // cap or overflow
+				delay = r.cfg.RetryMaxDelay
+				break
+			}
+		}
+	}
+	if r.cfg.RetryJitter > 0 {
+		delay += time.Duration(rand.Int63n(int64(r.cfg.RetryJitter)))
+	}
+	return delay
+}
+
 // Run executes the watch loop (or single-shot). Returns an exit code.
 func (r *Recorder) Run(ctx context.Context) int {
 	for {
@@ -105,11 +129,15 @@ func (r *Recorder) Run(ctx context.Context) int {
 			return exitCode // fatal/blocked: stop watching
 		}
 		// offline or session ended: sleep and retry
+		sleepDur := r.cfg.CheckInterval
+		if r.cfg.SleepJitter > 0 {
+			sleepDur += time.Duration(rand.Int63n(int64(r.cfg.SleepJitter)))
+		}
 		r.log.Event("SLEEP",
 			kv("source", r.cfg.Source),
-			kv("interval", units.FormatDuration(r.cfg.CheckInterval)))
+			kv("interval", units.FormatDuration(sleepDur)))
 		select {
-		case <-time.After(r.cfg.CheckInterval):
+		case <-time.After(sleepDur):
 		case <-ctx.Done():
 			return 0
 		}
@@ -185,14 +213,15 @@ func (r *Recorder) sessionLoop(ctx context.Context, initialInfo *stream.StreamIn
 		// Attempt to start a new recording within recording-timeout
 		deadline := time.Now().Add(r.cfg.RecordingTimeout)
 		var newInfo *stream.StreamInfo
-		for time.Now().Before(deadline) {
+		for attempt := 0; time.Now().Before(deadline); attempt++ {
 			if ctx.Err() != nil {
 				return 0
 			}
 
-			r.log.Debug("waiting %s before checking for new recording...", r.cfg.RetryDelay)
+			delay := r.retryDelay(attempt)
+			r.log.Debug("waiting %s before checking for new recording...", units.FormatDuration(delay))
 			select {
-			case <-time.After(r.cfg.RetryDelay):
+			case <-time.After(delay):
 			case <-ctx.Done():
 				return 0
 			}
@@ -551,6 +580,44 @@ func (r *Recorder) runFFmpegSegmented(ctx context.Context, streamURL, segPattern
 	recNum := fmt.Sprintf("%d", r.recordingCount-1)
 	targetDur := units.FormatDuration(r.cfg.SegmentLength)
 
+	// Heartbeat goroutine: periodically emits HEARTBEAT events while a segment is active.
+	if r.cfg.HeartbeatInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(r.cfg.HeartbeatInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					mu.Lock()
+					file := lastOpenedFile
+					segNum := startNumber + stderrSegCount - 1
+					segStart := segStarts[file]
+					mu.Unlock()
+					if file == "" {
+						continue
+					}
+					var bytesWritten int64
+					if fi, err := os.Stat(file); err == nil {
+						bytesWritten = fi.Size()
+					}
+					segDur := time.Duration(0)
+					if !segStart.IsZero() {
+						segDur = time.Since(segStart)
+					}
+					r.log.Event("HEARTBEAT",
+						kv("file", file),
+						kv("bytes_written", fmt.Sprintf("%d", bytesWritten)),
+						kv("segment_duration", units.FormatDuration(segDur)),
+						kv("session_duration", units.FormatDuration(time.Since(r.sessionStart))),
+						kv("recording", recNum),
+						kv("segment", fmt.Sprintf("%d", segNum)))
+				}
+			}
+		}()
+	}
+
 	// stderr goroutine: parse [segment @] Opening lines → SEGMENT START
 	wg.Add(1)
 	go func() {
@@ -757,15 +824,16 @@ func (r *Recorder) ffmpegInputArgs(streamURL, loglevel string) []string {
 
 // reconnect tries to reconnect within the segment timeout window.
 // Returns new StreamInfo on success, nil on timeout.
-func (r *Recorder) reconnect(ctx context.Context, current *stream.StreamInfo) *stream.StreamInfo {
+func (r *Recorder) reconnect(ctx context.Context, _ *stream.StreamInfo) *stream.StreamInfo {
 	deadline := time.Now().Add(r.cfg.SegmentTimeout)
-	for time.Now().Before(deadline) {
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
 		if ctx.Err() != nil {
 			return nil
 		}
 
+		delay := r.retryDelay(attempt)
 		select {
-		case <-time.After(r.cfg.RetryDelay):
+		case <-time.After(delay):
 		case <-ctx.Done():
 			return nil
 		}
@@ -785,7 +853,7 @@ func (r *Recorder) reconnect(ctx context.Context, current *stream.StreamInfo) *s
 			r.log.Error("%v (not retrying)", err)
 			return nil
 		}
-		r.log.Debug("reconnecting: %v (until %s)", err, deadline.Format("15:04:05"))
+		r.log.Debug("reconnecting: %v (delay %s, until %s)", err, units.FormatDuration(delay), deadline.Format("15:04:05"))
 	}
 	return nil
 }
