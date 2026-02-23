@@ -155,6 +155,16 @@ domain := flag.String("domain", "", "Override platform domain URL")
 	}
 
 	rec := recorder.New(cfg)
+
+	cookieVal := *cookies
+	if cookieVal == "" {
+		cookieVal = "none"
+	}
+	log.Event("STARTUP",
+		logger.KV{Key: "source", Value: *source},
+		logger.KV{Key: "driver", Value: *driverName},
+		logger.KV{Key: "cookies", Value: cookieVal})
+
 	os.Exit(rec.Run(ctx))
 }
 
