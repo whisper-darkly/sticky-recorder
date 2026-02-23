@@ -35,35 +35,40 @@ func (c *Chaturbate) CheckStream(ctx context.Context, opts stream.StreamOpts) (*
 
 	client := stream.NewHTTPClient(opts.Cookies, opts.UserAgent)
 
-	// Use the API endpoint (more reliable than scraping HTML)
-	apiURL := domain + "api/chatvideocontext/" + opts.Source + "/"
-	body, err := client.Get(ctx, apiURL)
-	if err != nil {
-		return nil, fmt.Errorf("fetch stream info: %w", err)
-	}
+	// Use HTML page scraping as the primary method. The API endpoint below is
+	// more structured but sits behind stricter Cloudflare rules, causing a
+	// disproportionate number of exit-code-3 (blocked) results in practice.
+	// See: chaturbate-dvr legacy behaviour — page scraping is what it used exclusively.
+	return c.checkStreamViaPage(ctx, client, domain, opts)
 
-	// Parse the JSON response to get the HLS source
-	var resp struct {
-		HLSSource  string `json:"hls_source"`
-		RoomStatus string `json:"room_status"`
-	}
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		// Fallback: try the page scraping method
-		return c.checkStreamViaPage(ctx, client, domain, opts)
-	}
-
-	if resp.HLSSource == "" {
-		if resp.RoomStatus == "private" || resp.RoomStatus == "hidden" {
-			return nil, stream.ErrPrivateStream
-		}
-		return nil, stream.ErrOffline
-	}
-
-	// Fetch and parse the master playlist for resolution selection
-	return c.resolvePlaylist(ctx, client, resp.HLSSource, opts.Resolution, opts.Framerate)
+	// --- API endpoint (kept for reference) ---
+	// The /api/chatvideocontext/ endpoint returns clean JSON but is more aggressively
+	// Cloudflare-gated than the regular page, leading to frequent blocked exits.
+	//
+	// apiURL := domain + "api/chatvideocontext/" + opts.Source + "/"
+	// body, err := client.Get(ctx, apiURL)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("fetch stream info: %w", err)
+	// }
+	// var resp struct {
+	// 	HLSSource  string `json:"hls_source"`
+	// 	RoomStatus string `json:"room_status"`
+	// }
+	// if err := json.Unmarshal([]byte(body), &resp); err != nil {
+	// 	// Fallback: try the page scraping method
+	// 	return c.checkStreamViaPage(ctx, client, domain, opts)
+	// }
+	// if resp.HLSSource == "" {
+	// 	if resp.RoomStatus == "private" || resp.RoomStatus == "hidden" {
+	// 		return nil, stream.ErrPrivateStream
+	// 	}
+	// 	return nil, stream.ErrOffline
+	// }
+	// return c.resolvePlaylist(ctx, client, resp.HLSSource, opts.Resolution, opts.Framerate)
 }
 
-// checkStreamViaPage falls back to the HTML scraping method used by chaturbate-dvr.
+// checkStreamViaPage uses the HTML page scraping method (same approach as chaturbate-dvr).
+// The page is less aggressively Cloudflare-gated than the API endpoint.
 func (c *Chaturbate) checkStreamViaPage(ctx context.Context, client *stream.HTTPClient, domain string, opts stream.StreamOpts) (*stream.StreamInfo, error) {
 	body, err := client.Get(ctx, domain+opts.Source)
 	if err != nil {

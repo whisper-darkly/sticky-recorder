@@ -35,6 +35,10 @@ actions:
         - "/data/recordings/{{.Driver}}/{{.Source}}/{{.Session.Year}}-{{.Session.Month}}-{{.Session.Day}}_{{.Session.Hour}}-{{.Session.Minute}}-{{.Session.Second}}/{{.Recording.Year}}-{{.Recording.Month}}-{{.Recording.Day}}_{{.Recording.Hour}}-{{.Recording.Minute}}-{{.Recording.Second}}"
         - "-i"
         - "1m"
+        - "--sleep-jitter"
+        - "10s"
+        - "--retry-jitter"
+        - "30s"
         - "--output-format"
         - "json"
       parameters:
@@ -81,6 +85,10 @@ actions:
         - "/data/recordings/{{.Driver}}/{{.Source}}/{{.Session.Year}}-{{.Session.Month}}-{{.Session.Day}}_{{.Session.Hour}}-{{.Session.Minute}}-{{.Session.Second}}/{{.Recording.Year}}-{{.Recording.Month}}-{{.Recording.Day}}_{{.Recording.Hour}}-{{.Recording.Minute}}-{{.Recording.Second}}"
         - "-i"
         - "1m"
+        - "--sleep-jitter"
+        - "10s"
+        - "--retry-jitter"
+        - "30s"
         - "--output-format"
         - "json"
       parameters:
