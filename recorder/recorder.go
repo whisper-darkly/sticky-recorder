@@ -40,9 +40,8 @@ type Config struct {
 
 	SegmentLength time.Duration // Max segment duration (0 = no splitting)
 
-	RetryDelay       time.Duration // Base delay between retry attempts
-	RetryMaxDelay    time.Duration // Max retry delay cap for exponential backoff (0 = no cap)
-	RetryJitter      time.Duration // Max random jitter added to each retry delay (0 = disabled)
+	RetryDelay  time.Duration // Delay between retry attempts
+	RetryJitter time.Duration // Max random jitter added to each retry delay (0 = disabled)
 	SegmentTimeout   time.Duration // Reconnect within this = same recording, new segment
 	RecordingTimeout time.Duration // Reconnect within this = new recording in same session
 	CheckInterval    time.Duration // Watch mode interval (0 = one-shot, exit on offline/end)
@@ -99,19 +98,9 @@ func New(cfg Config) *Recorder {
 	}
 }
 
-// retryDelay computes the delay for a retry attempt using exponential backoff
-// (if RetryMaxDelay > 0) and adds a random jitter in [0, RetryJitter).
-func (r *Recorder) retryDelay(attempt int) time.Duration {
+// retryDelay returns the configured retry delay plus a random jitter in [0, RetryJitter).
+func (r *Recorder) retryDelay() time.Duration {
 	delay := r.cfg.RetryDelay
-	if r.cfg.RetryMaxDelay > 0 && attempt > 0 {
-		for i := 0; i < attempt; i++ {
-			delay *= 2
-			if delay >= r.cfg.RetryMaxDelay || delay < 0 { // cap or overflow
-				delay = r.cfg.RetryMaxDelay
-				break
-			}
-		}
-	}
 	if r.cfg.RetryJitter > 0 {
 		delay += time.Duration(rand.Int63n(int64(r.cfg.RetryJitter)))
 	}
@@ -213,12 +202,12 @@ func (r *Recorder) sessionLoop(ctx context.Context, initialInfo *stream.StreamIn
 		// Attempt to start a new recording within recording-timeout
 		deadline := time.Now().Add(r.cfg.RecordingTimeout)
 		var newInfo *stream.StreamInfo
-		for attempt := 0; time.Now().Before(deadline); attempt++ {
+		for time.Now().Before(deadline) {
 			if ctx.Err() != nil {
 				return 0
 			}
 
-			delay := r.retryDelay(attempt)
+			delay := r.retryDelay()
 			r.log.Debug("waiting %s before checking for new recording...", units.FormatDuration(delay))
 			select {
 			case <-time.After(delay):
@@ -826,12 +815,12 @@ func (r *Recorder) ffmpegInputArgs(streamURL, loglevel string) []string {
 // Returns new StreamInfo on success, nil on timeout.
 func (r *Recorder) reconnect(ctx context.Context, _ *stream.StreamInfo) *stream.StreamInfo {
 	deadline := time.Now().Add(r.cfg.SegmentTimeout)
-	for attempt := 0; time.Now().Before(deadline); attempt++ {
+	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return nil
 		}
 
-		delay := r.retryDelay(attempt)
+		delay := r.retryDelay()
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
