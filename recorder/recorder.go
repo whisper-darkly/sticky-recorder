@@ -222,16 +222,19 @@ func (r *Recorder) sessionLoop(ctx context.Context, initialInfo *stream.StreamIn
 			}
 
 			itype := r.cfg.Driver.ClassifyError(err)
-			if itype == stream.Blocked {
-				r.penalizeCookie()
-				r.log.Error("%v (not retrying)", err)
-				return 3
-			}
 			if itype == stream.Fatal {
 				r.log.Error("%v (not retrying)", err)
 				return 1
 			}
-			r.log.Debug("source not available: %v (retrying until %s)", err, deadline.Format("15:04:05"))
+			// Blocked is treated as transient here: a Cloudflare challenge during a
+			// between-recording check is often short-lived. Penalize the cookie and
+			// keep retrying within the deadline rather than hard-exiting with code 3.
+			if itype == stream.Blocked {
+				r.penalizeCookie()
+				r.log.Warn("access blocked, retrying: %v", err)
+			} else {
+				r.log.Debug("source not available: %v (retrying until %s)", err, deadline.Format("15:04:05"))
+			}
 		}
 
 		if newInfo == nil {
@@ -833,16 +836,18 @@ func (r *Recorder) reconnect(ctx context.Context, _ *stream.StreamInfo) *stream.
 		}
 
 		it := r.cfg.Driver.ClassifyError(err)
-		if it == stream.Blocked {
-			r.penalizeCookie()
-			r.log.Error("%v (not retrying)", err)
-			return nil
-		}
 		if it == stream.Fatal {
 			r.log.Error("%v (not retrying)", err)
 			return nil
 		}
-		r.log.Debug("reconnecting: %v (delay %s, until %s)", err, units.FormatDuration(delay), deadline.Format("15:04:05"))
+		// Blocked is treated as transient during reconnect: penalize the cookie
+		// and keep retrying within the segment timeout window.
+		if it == stream.Blocked {
+			r.penalizeCookie()
+			r.log.Warn("access blocked during reconnect, retrying: %v", err)
+		} else {
+			r.log.Debug("reconnecting: %v (delay %s, until %s)", err, units.FormatDuration(delay), deadline.Format("15:04:05"))
+		}
 	}
 	return nil
 }
