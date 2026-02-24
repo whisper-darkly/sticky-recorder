@@ -39,8 +39,8 @@ build: ## Build the sticky-recorder image (bundles sticky-overseer)
 
 export: build ## Build and export image to docker/dist/
 	@mkdir -p $(DIST_DIR)
-	docker save -o $(DIST_DIR)/$(IMAGE_NAME)-$(VERSION).tar $(IMAGE_NAME):$(VERSION) $(IMAGE_NAME):latest
-	@echo "Exported $(DIST_DIR)/$(IMAGE_NAME)-$(VERSION).tar  ($$(du -h $(DIST_DIR)/$(IMAGE_NAME)-$(VERSION).tar | cut -f1))"
+	docker save $(IMAGE_NAME):$(VERSION) $(IMAGE_NAME):latest | gzip > $(DIST_DIR)/$(IMAGE_NAME)-$(VERSION).tar.gz
+	@echo "Exported $(DIST_DIR)/$(IMAGE_NAME)-$(VERSION).tar.gz  ($$(du -h $(DIST_DIR)/$(IMAGE_NAME)-$(VERSION).tar.gz | cut -f1))"
 
 load: ## Load a previously exported tar. Usage: make load FILE=dist/sticky-recorder-*.tar
 	@if [ -z "$(FILE)" ]; then \
