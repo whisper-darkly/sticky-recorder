@@ -114,10 +114,14 @@ func (r *Recorder) Run(ctx context.Context) int {
 		if r.cfg.CheckInterval <= 0 {
 			return exitCode // one-shot: pass through
 		}
-		if exitCode == 1 || exitCode == 3 || ctx.Err() != nil {
-			return exitCode // fatal/blocked: stop watching
+		if exitCode == 3 || ctx.Err() != nil {
+			return exitCode // blocked/cancelled: stop watching
 		}
-		// offline or session ended: sleep and retry
+		// code 1 (transient error) is treated the same as code 2 (offline): sleep and retry.
+		// exiting on transient errors causes rapid process restarts which hammer the CDN,
+		// triggering Cloudflare blocks (code 3) and making the problem worse. context
+		// cancellation (the only genuinely fatal code-1 case) is already caught by ctx.Err() above.
+		// offline, transient error, or session ended: sleep and retry
 		sleepDur := r.cfg.CheckInterval
 		if r.cfg.SleepJitter > 0 {
 			sleepDur += time.Duration(rand.Int63n(int64(r.cfg.SleepJitter)))
