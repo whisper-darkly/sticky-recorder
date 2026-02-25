@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/grafov/m3u8"
@@ -92,11 +93,16 @@ func (c *Chaturbate) checkStreamViaPage(ctx context.Context, client *stream.HTTP
 	}
 	raw := body[start : start+end]
 
-	// Decode unicode escapes
-	decoded := strings.ReplaceAll(raw, `\u0022`, `"`)
-	decoded = strings.ReplaceAll(decoded, `\u0027`, `'`)
-	decoded = strings.ReplaceAll(decoded, `\/`, `/`)
-	decoded = strings.ReplaceAll(decoded, `\\`, `\`)
+	// the room dossier is a JS string with unicode escapes (\u0022 etc).
+	// manual replacement is fragile — the \\→\ step creates invalid JSON
+	// escapes (\o, \g, etc.) from user-generated content in bios/subjects.
+	// strconv.Unquote handles all escape sequences correctly.
+	quoted := strconv.Quote(raw)
+	quoted = strings.Replace(quoted, `\\u`, `\u`, -1)
+	decoded, err := strconv.Unquote(quoted)
+	if err != nil {
+		return nil, fmt.Errorf("decode room dossier: %w", err)
+	}
 
 	var room struct {
 		HLSSource string `json:"hls_source"`
